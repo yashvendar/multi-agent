@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 
 from langchain_core.messages import SystemMessage
-from langchain_google_vertexai import ChatVertexAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.prebuilt import create_react_agent
 
 from config import settings
@@ -31,7 +31,7 @@ logger = logging.getLogger("agents.data_explorer")
 
 def build_data_explorer_agent():
     """Construct and register the Data Explorer agent."""
-    llm = ChatVertexAI(
+    llm = ChatGoogleGenerativeAI(
         model=settings.subagent_model,
         project=settings.google_cloud_project,
         location=settings.google_cloud_location,

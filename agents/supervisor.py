@@ -22,7 +22,7 @@ import time
 from typing import Annotated, Any, AsyncIterator, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_google_vertexai import ChatVertexAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
@@ -162,7 +162,7 @@ class RouterDecision(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_supervisor_llm() -> Any:
-    return ChatVertexAI(
+    return ChatGoogleGenerativeAI(
         model=settings.supervisor_model,
         project=settings.google_cloud_project,
         location=settings.google_cloud_location,

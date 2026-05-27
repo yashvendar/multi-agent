@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     google_cloud_project: str
     google_cloud_location: str = "us-central1"
 
+    # ── Application Configuration ─────────────────────────────────────────────
+    log_level: str = "INFO"
+
     # ── Model selection ─────────────────────────────────────────────────────
     # Supervisor: fast routing decisions
     supervisor_model: str = "gemini-2.0-flash"
