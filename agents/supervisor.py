@@ -14,8 +14,10 @@ Model: gemini-2.0-flash  (fast routing, low latency)
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import operator
 import time
 from typing import Annotated, Any, AsyncIterator, Literal
 
@@ -118,8 +120,14 @@ class SupervisorState(TypedDict):
     # Populated by supervisor_node, consumed by sub-agent nodes
     next_agent: str
     supervisor_reasoning: str
-    # Accumulated reasoning trace for the current turn
-    reasoning_trace: list[dict]
+    # operator.add appends new steps rather than replacing — each node
+    # returns ONLY its own new steps; the reducer accumulates them.
+    reasoning_trace: Annotated[list[dict], operator.add]
+    # Tracks "agent_name::query_hash" pairs for calls already made this turn.
+    # Using a hash of the actual query allows the same agent to be called again
+    # with a DIFFERENT query (e.g. enriched context from another agent), while
+    # still blocking exact duplicate (agent, query) combinations.
+    routing_history: Annotated[list[str], operator.add]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,15 +168,43 @@ def _build_supervisor_llm() -> Any:
 def make_supervisor_node(llm_with_structured_output):
     def supervisor_node(state: SupervisorState) -> dict:
         """Analyse the conversation and decide routing."""
+
+        # Build a context block listing (agent, query) pairs already executed
+        # so the supervisor knows what data it already has and what it can still request.
+        routing_history: list[str] = state.get("routing_history", [])
+        context_lines = []
+        if routing_history:
+            context_lines.append(
+                f"\n[CONTEXT] Agent calls already made this turn: {', '.join(routing_history)}."
+                " You MAY call the same agent again IF you have a different/enriched query."
+                " You MUST NOT send the exact same query to the same agent again."
+                " Set next=FINISH when you have all the data you need."
+            )
+            # Summarise previous sub-agent answers from messages
+            ai_messages = [m for m in state["messages"] if isinstance(m, AIMessage)]
+            if ai_messages:
+                summaries = [
+                    f"  [{i+1}] {ai_messages[i].content[:300]}"
+                    for i in range(min(len(ai_messages), len(routing_history)))
+                ]
+                context_lines.append("[DATA COLLECTED SO FAR]\n" + "\n".join(summaries))
+
+        context_block = "\n".join(context_lines)
+
+        system_content = SUPERVISOR_SYSTEM_PROMPT
+        if context_block:
+            system_content = SUPERVISOR_SYSTEM_PROMPT + "\n" + context_block
+
         messages = [
-            SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
+            SystemMessage(content=system_content),
             *state["messages"],
         ]
         decision: RouterDecision = llm_with_structured_output.invoke(messages)
 
         logger.info(
-            "Supervisor decision: next=%s reasoning=%s",
+            "Supervisor decision: next=%s routing_history=%s reasoning=%s",
             decision.next,
+            routing_history,
             decision.reasoning,
         )
 
@@ -185,7 +221,8 @@ def make_supervisor_node(llm_with_structured_output):
         return {
             "next_agent": decision.next,
             "supervisor_reasoning": decision.reasoning,
-            "reasoning_trace": state.get("reasoning_trace", []) + [trace_entry],
+            # Return ONLY the new entry — operator.add appends it to the state.
+            "reasoning_trace": [trace_entry],
             "messages": new_messages,
         }
 
@@ -218,6 +255,17 @@ def make_sub_agent_node(agent_name: str):
         trace_steps: list[dict] = []
         pending_reasoning: str | None = None
 
+        # Build a tool_call_id → tool_name map from all AIMessages upfront.
+        # ToolMessage only carries tool_call_id, NOT the name reliably.
+        tool_id_to_name: dict[str, str] = {}
+        for msg in sub_messages:
+            if isinstance(msg, AIMessage):
+                for tc in getattr(msg, "tool_calls", []) or []:
+                    call_id = tc.get("id") or tc.get("tool_call_id", "")
+                    name = tc.get("name", "unknown")
+                    if call_id:
+                        tool_id_to_name[call_id] = name
+
         for msg in sub_messages:
             if isinstance(msg, AIMessage):
                 # Text content before tool calls = reasoning
@@ -243,8 +291,15 @@ def make_sub_agent_node(agent_name: str):
                     pending_reasoning = None  # consumed
 
             else:
-                # ToolMessage — the result of a tool call
-                tool_name = getattr(msg, "name", "unknown_tool")
+                # ToolMessage — resolve name via tool_call_id lookup map.
+                # msg.name is sometimes populated, sometimes empty — the
+                # id→name map built above is the authoritative source.
+                call_id = getattr(msg, "tool_call_id", "") or ""
+                tool_name = (
+                    tool_id_to_name.get(call_id)
+                    or getattr(msg, "name", None)
+                    or "unknown_tool"
+                )
                 output_str = str(getattr(msg, "content", ""))[:800]
                 tool_trace = ToolCallTrace(
                     agent=agent_name,
@@ -279,10 +334,23 @@ def make_sub_agent_node(agent_name: str):
             ).model_dump(mode="json")
         )
 
+        # Compute a fingerprint of the query that was sent to this agent.
+        # Using the last human message content ensures that if the supervisor
+        # enriches the context (adds a new HumanMessage), the hash changes and
+        # the same agent can legitimately be called again.
+        human_msgs = [m for m in state["messages"] if isinstance(m, HumanMessage)]
+        query_content = human_msgs[-1].content if human_msgs else ""
+        query_hash = hashlib.md5(query_content.encode()).hexdigest()[:10]
+        route_key = f"{agent_name}::{query_hash}"
+
         return {
             "messages": [AIMessage(content=final_answer)],
-            "reasoning_trace": state.get("reasoning_trace", []) + trace_steps,
+            # Return ONLY new steps — operator.add appends them to the state.
+            "reasoning_trace": trace_steps,
             "next_agent": "FINISH",
+            # Record this (agent, query_hash) pair so the guard can detect
+            # exact duplicate calls while allowing the same agent with new context.
+            "routing_history": [route_key],
         }
 
     return sub_agent_node
@@ -293,10 +361,54 @@ def make_sub_agent_node(agent_name: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def route_after_supervisor(state: SupervisorState) -> str:
+    """
+    Decides the next node after the supervisor makes a routing decision.
+
+    Three scenarios
+    ---------------
+    1. Single-domain query
+       supervisor → agent_A → supervisor → FINISH
+
+    2. Multi-domain query (supervisor chains agents)
+       supervisor → agent_A → supervisor → agent_B → supervisor → FINISH
+
+    3. Same agent, DIFFERENT query (legitimate re-call)
+       supervisor → agent_A (query 1) → supervisor → agent_A (query 2) → FINISH
+       Allowed because routing_history keys on (agent, query_hash).
+
+    4. Guard fires — exact duplicate (same agent, same query hash)
+       Forced to END to prevent an infinite loop.
+    """
     next_agent = state.get("next_agent", "FINISH")
+    routing_history: list[str] = state.get("routing_history", [])
+
     if next_agent == "FINISH":
         return END
-    return next_agent  # node name matches agent name
+
+    # Compute the fingerprint for the query that would be sent to next_agent.
+    human_msgs = [m for m in state.get("messages", []) if isinstance(m, HumanMessage)]
+    query_content = human_msgs[-1].content if human_msgs else ""
+    query_hash = hashlib.md5(query_content.encode()).hexdigest()[:10]
+    route_key = f"{next_agent}::{query_hash}"
+
+    # Only block if this EXACT (agent, query) pair was already executed.
+    if route_key in routing_history:
+        logger.warning(
+            "Loop guard: exact duplicate route detected '%s' (hash=%s). "
+            "Forcing END — supervisor will use its last synthesised answer.",
+            next_agent,
+            query_hash,
+        )
+        return END
+
+    logger.info(
+        "Routing to '%s' (query_hash=%s) | history: %s",
+        next_agent,
+        query_hash,
+        routing_history or "none",
+    )
+    return next_agent
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,7 +442,12 @@ def build_supervisor_graph():
             END: END,
         },
     )
-    # After any sub-agent finishes, go back to supervisor to decide FINISH/re-route
+    # After a sub-agent answers, control returns to supervisor so it can:
+    # a) call another agent for additional data, or
+    # b) call the SAME agent with an enriched query, or
+    # c) synthesise a final answer and FINISH.
+    # The routing_history guard in route_after_supervisor prevents exact
+    # duplicate (agent, query) pairs from being executed twice.
     graph.add_edge("kpi_configurator", "supervisor")
     graph.add_edge("data_explorer", "supervisor")
     graph.add_edge("amm", "supervisor")
@@ -381,6 +498,7 @@ async def stream_graph_events(
         "next_agent": "",
         "supervisor_reasoning": "",
         "reasoning_trace": [],
+        "routing_history": [],
     }
 
     final_answer = ""
@@ -497,6 +615,7 @@ async def invoke_graph(
         "next_agent": "",
         "supervisor_reasoning": "",
         "reasoning_trace": [],
+        "routing_history": [],
     }
 
     result = await compiled_graph.ainvoke(

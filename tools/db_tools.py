@@ -174,37 +174,37 @@ def make_db_tools(
     """
     from langchain_core.tools import tool
 
-    @tool(name_or_callable=f"{prefix}_query_db")
+    schema_hint = (
+        f"Schemas available: {', '.join(schemas)}." if schemas else "All non-system schemas."
+    )
+
+    @tool(
+        name_or_callable=f"{prefix}_query_db",
+        description=(
+            f"Execute a read-only SQL SELECT query against the {prefix.upper()} database. "
+            f"{schema_hint} "
+            f"Returns JSON with keys: columns, rows, row_count, truncated. "
+            f"Write operations (INSERT/UPDATE/DELETE/DDL) are blocked. "
+            f"Always call {prefix}_get_schema first to learn the correct table and column names."
+        ),
+    )
     def query_db(sql: str) -> str:
-        f"""
-        Execute a read-only SQL query against the {prefix.upper()} database.
-
-        Use this tool to retrieve data. Write operations (INSERT, UPDATE,
-        DELETE, DDL) are blocked at the connection level.
-
-        Args:
-            sql: A valid SELECT (or read-only) SQL statement.
-
-        Returns:
-            JSON string with keys: columns, rows, row_count, truncated.
-        """
+        """Run a read-only SQL query. See tool description for details."""
         logger.info("[%s] query_db called: %.120s", prefix, sql)
         return _execute_readonly_query(dsn, sql, max_rows)
 
-    @tool(name_or_callable=f"{prefix}_get_schema")
+    @tool(
+        name_or_callable=f"{prefix}_get_schema",
+        description=(
+            f"Return the full database schema for the {prefix.upper()} database. "
+            f"{schema_hint} "
+            f"Output is a JSON object: {{schema → table → [{{column, type, nullable, pk}}]}}. "
+            f"Always call this BEFORE writing any SQL query so you know the exact "
+            f"table names, column names, and data types."
+        ),
+    )
     def get_schema() -> str:
-        f"""
-        Return the full database schema for the {prefix.upper()} database.
-
-        Returns a JSON object mapping schema → table → list of column definitions
-        (name, data type, nullable, primary key flag).
-
-        Use this BEFORE writing queries so you know the correct table and
-        column names.
-
-        Returns:
-            JSON string with the full schema metadata.
-        """
+        """Return schema metadata for the database. See tool description for details."""
         logger.info("[%s] get_schema called", prefix)
         return _get_schema(dsn, schemas)
 

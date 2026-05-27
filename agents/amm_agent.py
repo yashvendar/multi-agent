@@ -8,9 +8,11 @@ Responsibilities
 - Asset hierarchy and parent/child relationships
 - Asset metadata: type, location, manufacturer, install date, status
 - Mapping assets to sensors/tags
-- Cross-calls to KPI Configurator and Data Explorer as needed
 
 Model: gemini-2.5-pro
+
+Note: Cross-domain queries are handled by the Supervisor, which chains
+agents sequentially and synthesises the combined result.
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ from langgraph.prebuilt import create_react_agent
 
 from config import settings
 from prompts.agents import AMM_AGENT_SYSTEM_PROMPT
-from tools.agent_tools import AgentRegistry, make_cross_agent_tools
+from tools.agent_tools import AgentRegistry
 from tools.db_tools import make_db_tools
 
 logger = logging.getLogger("agents.amm")
@@ -44,11 +46,10 @@ def build_amm_agent():
         max_rows=settings.db_max_rows,
         schemas=settings.asset_schemas_list,
     )
-    cross_tools = make_cross_agent_tools(exclude=["amm"])
 
     agent = create_react_agent(
         model=llm,
-        tools=db_tools + cross_tools,
+        tools=db_tools,
         prompt=SystemMessage(content=AMM_AGENT_SYSTEM_PROMPT),
     )
 

@@ -7,9 +7,12 @@ Responsibilities
 ----------------
 - KPI definitions, formulas, thresholds, units
 - Calculated / aggregated KPI values for assets and time ranges
-- Cross-calls to Data Explorer (raw data) and AMM (asset metadata)
 
 Model: gemini-2.5-pro  (deep reasoning for formula analysis)
+
+Note: Cross-domain queries (e.g. needing asset metadata alongside KPI data)
+are handled by the Supervisor, which calls this agent and the AMM/Data Explorer
+sequentially and synthesises the combined result.
 """
 from __future__ import annotations
 
@@ -21,7 +24,7 @@ from langgraph.prebuilt import create_react_agent
 
 from config import settings
 from prompts.agents import KPI_AGENT_SYSTEM_PROMPT
-from tools.agent_tools import AgentRegistry, make_cross_agent_tools
+from tools.agent_tools import AgentRegistry
 from tools.db_tools import make_db_tools
 
 logger = logging.getLogger("agents.kpi")
@@ -49,16 +52,14 @@ def build_kpi_agent():
         max_rows=settings.db_max_rows,
         schemas=settings.kpi_schemas_list,
     )
-    cross_tools = make_cross_agent_tools(exclude=["kpi_configurator"])
-
-    all_tools = db_tools + cross_tools
 
     # ── Agent ────────────────────────────────────────────────────────────────
     agent = create_react_agent(
         model=llm,
-        tools=all_tools,
+        tools=db_tools,
         prompt=SystemMessage(content=KPI_AGENT_SYSTEM_PROMPT),
     )
+
 
     AgentRegistry.register("kpi_configurator", agent)
     logger.info("KPI Configurator agent built and registered.")
