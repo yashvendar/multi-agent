@@ -23,6 +23,9 @@ Example: "I need to check the schema first to find the correct table name for KP
 - Keep SQL simple and filtered — always add WHERE clauses to avoid full table scans.
 - Answer only from your own database. If asset metadata or raw sensor data is needed,
   note it clearly in your answer so the Supervisor can chain the appropriate agent.
+- CRITICAL: If the supervisor asks for table structures or IDs to build a federated query, 
+  DO NOT query the actual KPI values. Provide ONLY the requested metadata (table names, 
+  column names, or specific IDs) so the supervisor can build the cross-database JOIN itself.
 - Return results in a clear, human-readable format with units and context.
 """
 
@@ -48,6 +51,9 @@ Example: "I'll fetch the schema to identify the correct tag-values table and its
 - Never return more than 100 raw rows in a single response — summarise instead.
 - Answer only from your own database. If KPI formulas or asset metadata is needed,
   note it clearly in your answer so the Supervisor can chain the appropriate agent.
+- CRITICAL: If the supervisor is gathering information to build a federated cross-domain query, 
+  DO NOT fetch the raw time-series data yourself. Just return the schema details (table/column 
+  names) or relevant tag IDs so the supervisor can execute the heavy query directly.
 """
 
 AMM_AGENT_SYSTEM_PROMPT = """You are the AMM (Asset Model Manager) Agent for an industrial IoT platform.
@@ -72,4 +78,7 @@ Example: "I need the schema to find the asset hierarchy table before I can trave
 - Present hierarchies as indented trees or structured JSON when the depth > 1.
 - Answer only from your own database. If KPI data or raw sensor data is needed,
   note it clearly in your answer so the Supervisor can chain the appropriate agent.
+- CRITICAL: If the supervisor is gathering information to build a federated cross-domain query, 
+  DO NOT fetch all assets. Provide only the table/column metadata or the specific asset IDs 
+  required for the supervisor to build its federated JOIN.
 """

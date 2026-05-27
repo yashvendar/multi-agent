@@ -43,6 +43,7 @@ from models.schemas import (
 )
 from prompts.supervisor import SUPERVISOR_SYSTEM_PROMPT
 from tools.agent_tools import AgentRegistry
+from tools.db_tools import _execute_readonly_query
 
 logger = logging.getLogger("agents.supervisor")
 
@@ -138,8 +139,8 @@ class RouterDecision(BaseModel):
     reasoning: str = Field(
         description="One or two sentences explaining WHY you are routing to this agent or finishing."
     )
-    next: Literal["kpi_configurator", "data_explorer", "amm", "FINISH"] = Field(
-        description="Which agent to invoke next, or FINISH if the response is ready."
+    next: Literal["kpi_configurator", "data_explorer", "amm", "supervisor", "FINISH"] = Field(
+        description="Which agent to invoke next, or FINISH if the response is ready, or 'supervisor' if running a federated query."
     )
     agent_instruction: str | None = Field(
         default=None,
@@ -154,6 +155,14 @@ class RouterDecision(BaseModel):
     direct_response: str | None = Field(
         default=None,
         description="Only populated when next=FINISH. The supervisor's final synthesised answer.",
+    )
+    execute_federated_query: str | None = Field(
+        default=None,
+        description=(
+            "A SQL query to execute against the federated database (which connects KPI, IOT, and AMM data via postgres_fdw). "
+            "Use this ONLY when you need to join massive datasets across domains and have already obtained the schema/IDs "
+            "from sub-agents. If you provide this, you MUST set next='supervisor' so you can see the query result next turn."
+        ),
     )
 
 
@@ -225,9 +234,41 @@ def make_supervisor_node(llm_with_structured_output):
         ).model_dump(mode="json")
 
         new_messages: list[BaseMessage] = []
-        if decision.next == "FINISH" and decision.direct_response:
+        trace_entries = [trace_entry]
+
+        if decision.execute_federated_query:
+            if not settings.federated_db_dsn:
+                result_str = "Error: FEDERATED_DB_DSN not configured."
+            else:
+                try:
+                    result_str = _execute_readonly_query(
+                        settings.federated_db_dsn, decision.execute_federated_query, max_rows=500
+                    )
+                except Exception as e:
+                    result_str = f"Error executing federated query: {e}"
+
+            new_messages = [
+                AIMessage(content=f"Running federated query:\n```sql\n{decision.execute_federated_query}\n```"),
+                HumanMessage(content=f"Federated Query Result:\n{result_str}")
+            ]
+            
+            tool_trace = ToolCallTrace(
+                agent="supervisor",
+                tool="federated_query_db",
+                output=result_str[:800],
+            )
+            trace_entries.append(
+                AgentStepTrace(
+                    type="tool_result",
+                    agent="supervisor",
+                    tool_call=tool_trace,
+                ).model_dump(mode="json")
+            )
+            logger.info("Supervisor executed federated query.")
+            
+        elif decision.next == "FINISH" and decision.direct_response:
             new_messages = [AIMessage(content=decision.direct_response)]
-        elif decision.next != "FINISH" and decision.agent_instruction:
+        elif decision.next not in ["FINISH", "supervisor"] and decision.agent_instruction:
             # Inject a directed instruction as a new HumanMessage so the
             # sub-agent receives fresh context and does NOT repeat its previous step.
             new_messages = [HumanMessage(content=decision.agent_instruction)]
@@ -237,12 +278,18 @@ def make_supervisor_node(llm_with_structured_output):
                 decision.agent_instruction,
             )
 
+        # Build routing history key if doing a query
+        new_routing_history = []
+        if decision.execute_federated_query:
+            query_hash = hashlib.md5(decision.execute_federated_query.encode()).hexdigest()[:10]
+            new_routing_history = [f"supervisor::federated_query_{query_hash}"]
+
         return {
             "next_agent": decision.next,
             "supervisor_reasoning": decision.reasoning,
-            # Return ONLY the new entry — operator.add appends it to the state.
-            "reasoning_trace": [trace_entry],
+            "reasoning_trace": trace_entries,
             "messages": new_messages,
+            "routing_history": new_routing_history,
         }
 
     return supervisor_node
@@ -432,6 +479,7 @@ def build_supervisor_graph():
             "kpi_configurator": "kpi_configurator",
             "data_explorer": "data_explorer",
             "amm": "amm",
+            "supervisor": "supervisor",
             END: END,
         },
     )

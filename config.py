@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     # Used for LangGraph checkpointing and conversation history
     conv_db_dsn: str
 
+    # ── Federated database (READ-ONLY) ───────────────────────────────────────
+    # Used by the supervisor to run cross-domain queries
+    federated_db_dsn: str | None = None
+
+
     # ── API server ──────────────────────────────────────────────────────────
     api_host: str = "0.0.0.0"
     api_port: int = 8000
