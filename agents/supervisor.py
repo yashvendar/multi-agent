@@ -141,9 +141,19 @@ class RouterDecision(BaseModel):
     next: Literal["kpi_configurator", "data_explorer", "amm", "FINISH"] = Field(
         description="Which agent to invoke next, or FINISH if the response is ready."
     )
+    agent_instruction: str | None = Field(
+        default=None,
+        description=(
+            "Specific instruction to send to the next agent. "
+            "REQUIRED when routing to an agent that has already been called this turn — "
+            "give it a clear, targeted task based on data collected so far "
+            "(e.g. 'Fetch KPI values for asset_id=42 for the past 7 days'). "
+            "Leave None for the first call to an agent (it will use the user's original message)."
+        ),
+    )
     direct_response: str | None = Field(
         default=None,
-        description="Only populated when next=FINISH. The supervisor's direct answer.",
+        description="Only populated when next=FINISH. The supervisor's final synthesised answer.",
     )
 
 
@@ -214,9 +224,18 @@ def make_supervisor_node(llm_with_structured_output):
             content=decision.reasoning,
         ).model_dump(mode="json")
 
-        new_messages = []
+        new_messages: list[BaseMessage] = []
         if decision.next == "FINISH" and decision.direct_response:
             new_messages = [AIMessage(content=decision.direct_response)]
+        elif decision.next != "FINISH" and decision.agent_instruction:
+            # Inject a directed instruction as a new HumanMessage so the
+            # sub-agent receives fresh context and does NOT repeat its previous step.
+            new_messages = [HumanMessage(content=decision.agent_instruction)]
+            logger.info(
+                "Supervisor injected instruction for %s: %.120s",
+                decision.next,
+                decision.agent_instruction,
+            )
 
         return {
             "next_agent": decision.next,
@@ -364,47 +383,21 @@ def route_after_supervisor(state: SupervisorState) -> str:
     """
     Decides the next node after the supervisor makes a routing decision.
 
-    Three scenarios
-    ---------------
-    1. Single-domain query
-       supervisor → agent_A → supervisor → FINISH
+    The supervisor is free to call any sub-agent as many times as it needs.
+    When re-calling the same agent, it should set agent_instruction so the
+    agent receives a directed task rather than repeating the original query.
 
-    2. Multi-domain query (supervisor chains agents)
-       supervisor → agent_A → supervisor → agent_B → supervisor → FINISH
-
-    3. Same agent, DIFFERENT query (legitimate re-call)
-       supervisor → agent_A (query 1) → supervisor → agent_A (query 2) → FINISH
-       Allowed because routing_history keys on (agent, query_hash).
-
-    4. Guard fires — exact duplicate (same agent, same query hash)
-       Forced to END to prevent an infinite loop.
+    The only hard limit is the graph's recursion_limit (set at compile time).
     """
     next_agent = state.get("next_agent", "FINISH")
-    routing_history: list[str] = state.get("routing_history", [])
 
     if next_agent == "FINISH":
         return END
 
-    # Compute the fingerprint for the query that would be sent to next_agent.
-    human_msgs = [m for m in state.get("messages", []) if isinstance(m, HumanMessage)]
-    query_content = human_msgs[-1].content if human_msgs else ""
-    query_hash = hashlib.md5(query_content.encode()).hexdigest()[:10]
-    route_key = f"{next_agent}::{query_hash}"
-
-    # Only block if this EXACT (agent, query) pair was already executed.
-    if route_key in routing_history:
-        logger.warning(
-            "Loop guard: exact duplicate route detected '%s' (hash=%s). "
-            "Forcing END — supervisor will use its last synthesised answer.",
-            next_agent,
-            query_hash,
-        )
-        return END
-
+    routing_history: list[str] = state.get("routing_history", [])
     logger.info(
-        "Routing to '%s' (query_hash=%s) | history: %s",
+        "Routing to '%s' | call history this turn: %s",
         next_agent,
-        query_hash,
         routing_history or "none",
     )
     return next_agent
