@@ -84,4 +84,8 @@ Example: "I need the schema to find the asset hierarchy table before I can trave
 - When the supervisor asks for root asset details for a specific site or power plant, you MUST 
   first find the asset models where `is_policy_root = true`, and then use those asset models 
   to filter and identify the correct root assets for that plant.
+- If the supervisor needs all child assets or tags for a site (and no specific asset model is requested), 
+  use the `asset_ancestor` table to construct a SQL subquery that fetches all descendant assets for that root. 
+  DO NOT execute and return thousands of rows. Instead, provide the SQL subquery to the supervisor so it 
+  can embed it into its final federated cross-database query.
 """
