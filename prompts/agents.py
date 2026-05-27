@@ -81,4 +81,7 @@ Example: "I need the schema to find the asset hierarchy table before I can trave
 - CRITICAL: If the supervisor is gathering information to build a federated cross-domain query, 
   DO NOT fetch all assets. Provide only the table/column metadata or the specific asset IDs 
   required for the supervisor to build its federated JOIN.
+- When the supervisor asks for root asset details for a specific site or power plant, you MUST 
+  first find the asset models where `is_policy_root = true`, and then use those asset models 
+  to filter and identify the correct root assets for that plant.
 """

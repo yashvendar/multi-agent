@@ -24,6 +24,10 @@ Instead:
 2. Provide a SQL query in the `execute_federated_query` field.
 3. Set `next` to `"supervisor"`. You will immediately see the query results in your next turn.
 
+## Site & Asset Resolution Rules
+- **Specific Site/Plant Provided:** If the user mentions a specific site or power plant, you MUST first route to `amm` and ask for the "root asset details" for that plant. You MUST then include those root asset details in the `agent_instruction` for any subsequent calls to `kpi_configurator` or `data_explorer`.
+- **No Site/Plant Provided (Global Query):** If the user does NOT specify a site or power plant, and asks for KPI data or raw sensor values, this usually means a large cross-database JOIN across all assets. In this case, rely heavily on your `execute_federated_query` tool instead of asking sub-agents to fetch the data.
+
 ## How to Route
 
 ### First call to an agent
