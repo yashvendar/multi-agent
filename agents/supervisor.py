@@ -139,8 +139,13 @@ class RouterDecision(BaseModel):
     reasoning: str = Field(
         description="One or two sentences explaining WHY you are routing to this agent or finishing."
     )
-    next: Literal["kpi_configurator", "data_explorer", "amm", "supervisor", "FINISH"] = Field(
-        description="Which agent to invoke next, or FINISH if the response is ready, or 'supervisor' if running a federated query."
+    next: Literal["kpi_configurator", "data_explorer", "amm", "supervisor", "summarise", "FINISH"] = Field(
+        description=(
+            "Which agent to invoke next, or "
+            "'summarise' once all data is collected (triggers synthesis node), or "
+            "'FINISH' only for direct replies that need no synthesis (greetings, etc.), or "
+            "'supervisor' when running a federated query."
+        )
     )
     agent_instruction: str | None = Field(
         default=None,
@@ -173,11 +178,18 @@ class RouterDecision(BaseModel):
 def _build_supervisor_llm() -> Any:
     return ChatGoogleGenerativeAI(
         model=settings.supervisor_model,
-        project=settings.google_cloud_project,
-        location=settings.google_cloud_location,
         temperature=0,
         max_retries=2,
     ).with_structured_output(RouterDecision)
+
+
+def _build_synthesis_llm() -> Any:
+    """Plain (non-structured) LLM used by the summarise node."""
+    return ChatGoogleGenerativeAI(
+        model=settings.supervisor_model,
+        temperature=0,
+        max_retries=2,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,12 +279,9 @@ def make_supervisor_node(llm_with_structured_output):
             logger.info("Supervisor executed federated query.")
             
         elif decision.next == "FINISH":
-            # Guard: LLM sometimes omits direct_response even on FINISH.
-            # Use a sensible default — never expose internal reasoning to the user.
-            reply = decision.direct_response or (
-                "Hello! I'm your Industrial IoT assistant. "
-                "You can ask me about KPI values, raw sensor data, or asset details."
-            )
+            # Direct response — no synthesis needed (greetings, simple chitchat).
+            # direct_response MUST be non-null here per prompt instructions.
+            reply = decision.direct_response or "Hello! How can I help you with your IoT data today?"
             new_messages = [AIMessage(content=reply)]
         elif decision.next not in ["FINISH", "supervisor"] and decision.agent_instruction:
             # Inject a directed instruction as a new HumanMessage so the
@@ -429,6 +438,60 @@ def make_sub_agent_node(agent_name: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Summarise node — final synthesis, goes straight to END
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SYNTHESIS_SYSTEM_PROMPT = """You are the final response writer for an industrial IoT assistant.
+
+You have been given the original user question and all data collected by specialist agents.
+Your ONLY job is to write a clear, professional, user-facing answer.
+
+Rules:
+- Synthesise all data into a single coherent narrative.
+- Use plain language. Do not expose SQL, internal IDs, or JSON blobs.
+- Include units (MW, %, °C, etc.) for every numeric value.
+- Use a markdown table when the result has multiple rows or assets.
+- Write a paragraph summary when the result is a single value.
+- If no data was found, say so clearly and suggest what the user might check.
+- Do not mention agent names, routing steps, or internal process details.
+"""
+
+
+def make_summarise_node(synthesis_llm):
+    """
+    Dedicated synthesis node. Reads the full conversation (including all
+    sub-agent responses), writes the final user-facing answer, then routes to END.
+    Cannot call any sub-agent or itself.
+    """
+    async def summarise_node(state: SupervisorState) -> dict:
+        messages = [
+            SystemMessage(content=_SYNTHESIS_SYSTEM_PROMPT),
+            *state["messages"],
+            HumanMessage(
+                content="Based on all the data above, write the final answer for the user's original question."
+            ),
+        ]
+
+        result = await synthesis_llm.ainvoke(messages)
+        final_answer = result.content
+
+        logger.info("Summarise node produced answer (%.80s).", final_answer)
+
+        trace_entry = AgentStepTrace(
+            type="answer",
+            agent="summarise",
+            content=final_answer,
+        ).model_dump(mode="json")
+
+        return {
+            "messages": [AIMessage(content=final_answer)],
+            "reasoning_trace": [trace_entry],
+        }
+
+    return summarise_node
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Routing function
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -436,11 +499,10 @@ def route_after_supervisor(state: SupervisorState) -> str:
     """
     Decides the next node after the supervisor makes a routing decision.
 
-    The supervisor is free to call any sub-agent as many times as it needs.
-    When re-calling the same agent, it should set agent_instruction so the
-    agent receives a directed task rather than repeating the original query.
-
-    The only hard limit is the graph's recursion_limit (set at compile time).
+    next='summarise'        → dedicated synthesis node (goes to END)
+    next='FINISH'           → END immediately (direct replies only)
+    next='supervisor'       → loop back (federated query result)
+    next='<agent_name>'     → that sub-agent node
     """
     next_agent = state.get("next_agent", "FINISH")
 
@@ -467,6 +529,7 @@ def build_supervisor_graph():
     All sub-agents must be registered in AgentRegistry before calling this.
     """
     supervisor_llm = _build_supervisor_llm()
+    synthesis_llm = _build_synthesis_llm()
 
     graph = StateGraph(SupervisorState)
 
@@ -475,6 +538,7 @@ def build_supervisor_graph():
     graph.add_node("kpi_configurator", make_sub_agent_node("kpi_configurator"))
     graph.add_node("data_explorer", make_sub_agent_node("data_explorer"))
     graph.add_node("amm", make_sub_agent_node("amm"))
+    graph.add_node("summarise", make_summarise_node(synthesis_llm))
 
     # Edges
     graph.add_edge(START, "supervisor")
@@ -486,18 +550,16 @@ def build_supervisor_graph():
             "data_explorer": "data_explorer",
             "amm": "amm",
             "supervisor": "supervisor",
+            "summarise": "summarise",
             END: END,
         },
     )
-    # After a sub-agent answers, control returns to supervisor so it can:
-    # a) call another agent for additional data, or
-    # b) call the SAME agent with an enriched query, or
-    # c) synthesise a final answer and FINISH.
-    # The routing_history guard in route_after_supervisor prevents exact
-    # duplicate (agent, query) pairs from being executed twice.
+    # Sub-agents always return to supervisor for the next routing decision.
     graph.add_edge("kpi_configurator", "supervisor")
     graph.add_edge("data_explorer", "supervisor")
     graph.add_edge("amm", "supervisor")
+    # Summarise goes straight to END — no further routing.
+    graph.add_edge("summarise", END)
 
     compiled = graph.compile()
     logger.info("Supervisor graph compiled.")
