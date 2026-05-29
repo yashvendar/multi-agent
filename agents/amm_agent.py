@@ -26,6 +26,7 @@ from config import settings
 from prompts.agents import AMM_AGENT_SYSTEM_PROMPT
 from tools.agent_tools import AgentRegistry
 from tools.db_tools import make_db_tools
+from tools.rag_tools import make_search_docs_tool
 
 logger = logging.getLogger("agents.amm")
 
@@ -46,10 +47,11 @@ def build_amm_agent():
         max_rows=settings.db_max_rows,
         schemas=settings.asset_schemas_list,
     )
+    rag_tool = make_search_docs_tool(module="amm", prefix="asset")
 
     agent = create_react_agent(
         model=llm,
-        tools=db_tools,
+        tools=[*db_tools, rag_tool],
         prompt=SystemMessage(content=AMM_AGENT_SYSTEM_PROMPT),
     )
 

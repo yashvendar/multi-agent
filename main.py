@@ -29,6 +29,7 @@ from agents.kpi_agent import build_kpi_agent
 from agents.supervisor import build_supervisor_graph, invoke_graph, stream_graph_events
 from config import settings
 from db.conversation import get_history, get_recent_messages_for_context, init_db, save_message
+from db.docs import init_docs_table
 from models.schemas import (
     ChatRequest,
     ChatResponse,
@@ -57,6 +58,10 @@ async def lifespan(app: FastAPI):
 
     # 1. Initialise conversation DB (creates tables if needed)
     init_db()
+
+    # 2. Initialise docs vector table
+    docs_dsn = settings.docs_db_dsn or settings.conv_db_dsn
+    init_docs_table(docs_dsn)
 
     # 2. Build sub-agents (register in AgentRegistry)
     #    Order matters only for logging; cross-agent calls are lazy lookups
@@ -94,6 +99,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from routers.confluence import router as docs_router  # noqa: E402
+app.include_router(docs_router)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

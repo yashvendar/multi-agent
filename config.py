@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     # Used by the supervisor to run cross-domain queries
     federated_db_dsn: str | None = None
 
+    # ── Docs / vector database ────────────────────────────────────────────────
+    # Stores pgvector embeddings of Confluence pages.
+    # Falls back to conv_db_dsn if not set.
+    docs_db_dsn: str | None = None
+
+    # ── Embeddings ───────────────────────────────────────────────────────────
+    embedding_model: str = "models/text-embedding-004"  # 768 dims
+
+    # ── Confluence ───────────────────────────────────────────────────────────
+    confluence_url: str | None = None           # e.g. https://yourco.atlassian.net
+    confluence_username: str | None = None      # Atlassian account email
+    confluence_api_token: str | None = None     # Atlassian API token
 
     # ── API server ──────────────────────────────────────────────────────────
     api_host: str = "0.0.0.0"

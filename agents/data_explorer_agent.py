@@ -25,6 +25,7 @@ from config import settings
 from prompts.agents import DATA_EXPLORER_SYSTEM_PROMPT
 from tools.agent_tools import AgentRegistry
 from tools.db_tools import make_db_tools
+from tools.rag_tools import make_search_docs_tool
 
 logger = logging.getLogger("agents.data_explorer")
 
@@ -45,10 +46,11 @@ def build_data_explorer_agent():
         max_rows=settings.db_max_rows,
         schemas=settings.iot_schemas_list,
     )
+    rag_tool = make_search_docs_tool(module="iot", prefix="iot")
 
     agent = create_react_agent(
         model=llm,
-        tools=db_tools,
+        tools=[*db_tools, rag_tool],
         prompt=SystemMessage(content=DATA_EXPLORER_SYSTEM_PROMPT),
     )
 

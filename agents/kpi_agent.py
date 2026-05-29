@@ -26,6 +26,7 @@ from config import settings
 from prompts.agents import KPI_AGENT_SYSTEM_PROMPT
 from tools.agent_tools import AgentRegistry
 from tools.db_tools import make_db_tools
+from tools.rag_tools import make_search_docs_tool
 
 logger = logging.getLogger("agents.kpi")
 
@@ -52,11 +53,12 @@ def build_kpi_agent():
         max_rows=settings.db_max_rows,
         schemas=settings.kpi_schemas_list,
     )
+    rag_tool = make_search_docs_tool(module="kpi", prefix="kpi")
 
     # ── Agent ────────────────────────────────────────────────────────────────
     agent = create_react_agent(
         model=llm,
-        tools=db_tools,
+        tools=[*db_tools, rag_tool],
         prompt=SystemMessage(content=KPI_AGENT_SYSTEM_PROMPT),
     )
 
