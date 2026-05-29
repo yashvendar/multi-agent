@@ -266,8 +266,14 @@ def make_supervisor_node(llm_with_structured_output):
             )
             logger.info("Supervisor executed federated query.")
             
-        elif decision.next == "FINISH" and decision.direct_response:
-            new_messages = [AIMessage(content=decision.direct_response)]
+        elif decision.next == "FINISH":
+            # Guard: LLM sometimes omits direct_response even on FINISH.
+            # Use a sensible default — never expose internal reasoning to the user.
+            reply = decision.direct_response or (
+                "Hello! I'm your Industrial IoT assistant. "
+                "You can ask me about KPI values, raw sensor data, or asset details."
+            )
+            new_messages = [AIMessage(content=reply)]
         elif decision.next not in ["FINISH", "supervisor"] and decision.agent_instruction:
             # Inject a directed instruction as a new HumanMessage so the
             # sub-agent receives fresh context and does NOT repeat its previous step.
