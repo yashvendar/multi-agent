@@ -283,9 +283,16 @@ def make_supervisor_node(llm_with_structured_output):
                 # Proper direct reply (greeting, chitchat, general knowledge).
                 new_messages = [AIMessage(content=decision.direct_response)]
             else:
-                # No direct_response — supervisor said FINISH but didn't synthesise.
-                # route_after_supervisor will redirect to 'summarise' if needed.
-                pass
+                # No direct_response — route_after_supervisor will redirect to
+                # 'summarise' if sub-agent data exists, or END if it's a
+                # genuine greeting. Either way we need a fallback message for
+                # the pure-greeting path (no prior AI messages).
+                prior_ai = [
+                    m for m in state.get("messages", [])
+                    if isinstance(m, AIMessage)
+                ]
+                if not prior_ai:
+                    new_messages = [AIMessage(content="Hello! How can I help you with your IoT data today?")]
         elif decision.next not in ["FINISH", "supervisor"] and decision.agent_instruction:
             # Inject a directed instruction as a new HumanMessage so the
             # sub-agent receives fresh context and does NOT repeat its previous step.
@@ -655,16 +662,10 @@ async def stream_graph_events(
                         )
                         yield f"data: {event.model_dump_json()}\n\n"
                     else:
-                        # FINISH — extract direct_response from the AIMessage added by supervisor_node
+                        # FINISH with direct_response — read from the AIMessage.
                         msgs = node_output.get("messages", [])
                         if msgs:
                             final_answer = getattr(msgs[-1], "content", "")
-                        else:
-                            # Supervisor decided FINISH but did not populate direct_response.
-                            # Fall back to the reasoning text so the client always gets something.
-                            final_answer = node_output.get("supervisor_reasoning", "Done.")
-
-                        if final_answer:
                             event = SSEAnswerEvent(
                                 content=final_answer,
                                 session_id=session_id,
@@ -673,6 +674,9 @@ async def stream_graph_events(
                                 ),
                             )
                             yield f"data: {event.model_dump_json()}\n\n"
+                        # If msgs is empty → supervisor returned FINISH with no content
+                        # and route_after_supervisor will redirect to summarise.
+                        # The summarise node will emit the answer — nothing to do here.
 
                 else:
                     # Sub-agent node output — emit tool call trace events
