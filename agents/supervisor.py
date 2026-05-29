@@ -231,6 +231,7 @@ def make_supervisor_node(llm_with_structured_output):
             *state["messages"],
         ]
         decision: RouterDecision = llm_with_structured_output.invoke(messages)
+        next_agent = decision.next
 
         logger.info(
             "Supervisor decision: next=%s routing_history=%s reasoning=%s",
@@ -278,28 +279,26 @@ def make_supervisor_node(llm_with_structured_output):
             )
             logger.info("Supervisor executed federated query.")
             
-        elif decision.next == "FINISH":
+        elif next_agent == "FINISH":
             if decision.direct_response:
                 # Proper direct reply (greeting, chitchat, general knowledge).
                 new_messages = [AIMessage(content=decision.direct_response)]
             else:
-                # No direct_response — route_after_supervisor will redirect to
-                # 'summarise' if sub-agent data exists, or END if it's a
-                # genuine greeting. Either way we need a fallback message for
-                # the pure-greeting path (no prior AI messages).
-                prior_ai = [
-                    m for m in state.get("messages", [])
-                    if isinstance(m, AIMessage)
-                ]
-                if not prior_ai:
+                # LLM said FINISH but didn't write direct_response.
+                # If there's prior conversation, it likely just forgot to use 'summarise'.
+                has_prior_ai = any(isinstance(m, AIMessage) for m in state.get("messages", []))
+                if has_prior_ai:
+                    logger.info("Supervisor returned FINISH with no response — auto-redirecting to summarise.")
+                    next_agent = "summarise"
+                else:
                     new_messages = [AIMessage(content="Hello! How can I help you with your IoT data today?")]
-        elif decision.next not in ["FINISH", "supervisor"] and decision.agent_instruction:
+        elif next_agent not in ["FINISH", "supervisor"] and decision.agent_instruction:
             # Inject a directed instruction as a new HumanMessage so the
             # sub-agent receives fresh context and does NOT repeat its previous step.
             new_messages = [HumanMessage(content=decision.agent_instruction)]
             logger.info(
                 "Supervisor injected instruction for %s: %.120s",
-                decision.next,
+                next_agent,
                 decision.agent_instruction,
             )
 
@@ -310,7 +309,7 @@ def make_supervisor_node(llm_with_structured_output):
             new_routing_history = [f"supervisor::federated_query_{query_hash}"]
 
         return {
-            "next_agent": decision.next,
+            "next_agent": next_agent,
             "supervisor_reasoning": decision.reasoning,
             "reasoning_trace": trace_entries,
             "messages": new_messages,
@@ -506,38 +505,10 @@ def make_summarise_node(synthesis_llm):
 def route_after_supervisor(state: SupervisorState) -> str:
     """
     Decides the next node after the supervisor makes a routing decision.
-
-    next='summarise'    → dedicated synthesis node (goes to END)
-    next='FINISH'       → END immediately (only for direct replies with direct_response)
-                          If supervisor said FINISH but no direct_response was written
-                          AND sub-agents have produced data, auto-redirect to 'summarise'.
-    next='supervisor'   → loop back (federated query result)
-    next='<agent>'      → that sub-agent node
     """
-    next_agent = state.get("next_agent", "")
+    next_agent = state.get("next_agent", "FINISH")
 
-    if next_agent == "FINISH" or next_agent == "":
-        # Check whether the last supervisor message contains actual content
-        # (direct_response was written) or is empty (supervisor forgot to synthesise).
-        msgs = state.get("messages", [])
-        # The supervisor just appended its message as the last item.
-        # If the last AIMessage has no meaningful content, check for sub-agent data.
-        last_ai = next(
-            (m for m in reversed(msgs) if isinstance(m, AIMessage)),
-            None,
-        )
-        if last_ai is None or not getattr(last_ai, "content", "").strip():
-            # No usable response was written. Check if sub-agents produced data.
-            sub_agent_data = [
-                m for m in msgs
-                if isinstance(m, AIMessage) and len(getattr(m, "content", "")) > 30
-            ]
-            if sub_agent_data:
-                logger.info(
-                    "Supervisor returned FINISH with no response content — "
-                    "auto-routing to summarise."
-                )
-                return "summarise"
+    if next_agent == "FINISH":
         return END
 
     routing_history: list[str] = state.get("routing_history", [])
