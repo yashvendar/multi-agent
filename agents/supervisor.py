@@ -563,10 +563,16 @@ async def stream_graph_events(
                         )
                         yield f"data: {event.model_dump_json()}\n\n"
                     else:
-                        # FINISH with direct response
+                        # FINISH — extract direct_response from the AIMessage added by supervisor_node
                         msgs = node_output.get("messages", [])
                         if msgs:
                             final_answer = getattr(msgs[-1], "content", "")
+                        else:
+                            # Supervisor decided FINISH but did not populate direct_response.
+                            # Fall back to the reasoning text so the client always gets something.
+                            final_answer = node_output.get("supervisor_reasoning", "Done.")
+
+                        if final_answer:
                             event = SSEAnswerEvent(
                                 content=final_answer,
                                 session_id=session_id,
