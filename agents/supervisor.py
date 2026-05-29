@@ -279,10 +279,13 @@ def make_supervisor_node(llm_with_structured_output):
             logger.info("Supervisor executed federated query.")
             
         elif decision.next == "FINISH":
-            # Direct response — no synthesis needed (greetings, simple chitchat).
-            # direct_response MUST be non-null here per prompt instructions.
-            reply = decision.direct_response or "Hello! How can I help you with your IoT data today?"
-            new_messages = [AIMessage(content=reply)]
+            if decision.direct_response:
+                # Proper direct reply (greeting, chitchat, general knowledge).
+                new_messages = [AIMessage(content=decision.direct_response)]
+            else:
+                # No direct_response — supervisor said FINISH but didn't synthesise.
+                # route_after_supervisor will redirect to 'summarise' if needed.
+                pass
         elif decision.next not in ["FINISH", "supervisor"] and decision.agent_instruction:
             # Inject a directed instruction as a new HumanMessage so the
             # sub-agent receives fresh context and does NOT repeat its previous step.
@@ -428,9 +431,7 @@ def make_sub_agent_node(agent_name: str):
             "messages": [AIMessage(content=final_answer)],
             # Return ONLY new steps — operator.add appends them to the state.
             "reasoning_trace": trace_steps,
-            "next_agent": "FINISH",
-            # Record this (agent, query_hash) pair so the guard can detect
-            # exact duplicate calls while allowing the same agent with new context.
+            # Sub-agents do NOT set next_agent — supervisor owns all routing.
             "routing_history": [route_key],
         }
 
@@ -499,14 +500,37 @@ def route_after_supervisor(state: SupervisorState) -> str:
     """
     Decides the next node after the supervisor makes a routing decision.
 
-    next='summarise'        → dedicated synthesis node (goes to END)
-    next='FINISH'           → END immediately (direct replies only)
-    next='supervisor'       → loop back (federated query result)
-    next='<agent_name>'     → that sub-agent node
+    next='summarise'    → dedicated synthesis node (goes to END)
+    next='FINISH'       → END immediately (only for direct replies with direct_response)
+                          If supervisor said FINISH but no direct_response was written
+                          AND sub-agents have produced data, auto-redirect to 'summarise'.
+    next='supervisor'   → loop back (federated query result)
+    next='<agent>'      → that sub-agent node
     """
-    next_agent = state.get("next_agent", "FINISH")
+    next_agent = state.get("next_agent", "")
 
-    if next_agent == "FINISH":
+    if next_agent == "FINISH" or next_agent == "":
+        # Check whether the last supervisor message contains actual content
+        # (direct_response was written) or is empty (supervisor forgot to synthesise).
+        msgs = state.get("messages", [])
+        # The supervisor just appended its message as the last item.
+        # If the last AIMessage has no meaningful content, check for sub-agent data.
+        last_ai = next(
+            (m for m in reversed(msgs) if isinstance(m, AIMessage)),
+            None,
+        )
+        if last_ai is None or not getattr(last_ai, "content", "").strip():
+            # No usable response was written. Check if sub-agents produced data.
+            sub_agent_data = [
+                m for m in msgs
+                if isinstance(m, AIMessage) and len(getattr(m, "content", "")) > 30
+            ]
+            if sub_agent_data:
+                logger.info(
+                    "Supervisor returned FINISH with no response content — "
+                    "auto-routing to summarise."
+                )
+                return "summarise"
         return END
 
     routing_history: list[str] = state.get("routing_history", [])
