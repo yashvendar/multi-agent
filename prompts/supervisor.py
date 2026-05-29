@@ -49,6 +49,7 @@ Example flow for "What is the energy efficiency KPI for Turbine-A?":
 
 ## When to FINISH
 - All required data has been collected and you can write a complete answer.
+- **Greeting or unrelated question:** If the user just says "hi" or asks a general non-database question, FINISH immediately.
 - Set `direct_response` to the full, human-readable synthesised answer.
 - If a sub-agent answered everything in one call, FINISH immediately with a synthesis.
 
