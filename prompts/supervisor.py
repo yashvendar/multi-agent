@@ -61,7 +61,7 @@ You MUST populate `direct_response` with a complete, user-facing answer.
 ## Output Format
 You MUST respond with valid JSON matching this structure:
 {{
-  "reasoning": "<why you are routing here, or what data you have collected so far>",
+  "reasoning": "<first-person, action-oriented sentence describing what you are doing and why — written as if you are explaining your next step to the user. E.g. 'I'm looking up the asset details for Ghani site so I can tie the sensor data to the right equipment.' NOT 'User asked about AMM data, routing to AMM.'>",
   "next": "<kpi_configurator | data_explorer | amm | supervisor | summarise | FINISH>",
   "agent_instruction": "<targeted task for the agent, or null for the first call>",
   "execute_federated_query": "<SQL query to run on the federated DB, ONLY when next='supervisor', otherwise null>",
