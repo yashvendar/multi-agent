@@ -129,11 +129,44 @@ class SupervisorState(TypedDict):
     # with a DIFFERENT query (e.g. enriched context from another agent), while
     # still blocking exact duplicate (agent, query) combinations.
     routing_history: Annotated[list[str], operator.add]
+    # Planner output — set once by planner_node, consumed step-by-step by supervisor.
+    execution_plan: list[dict]   # list of {"agent": str, "goal": str, "order": int}
+    plan_step: int               # index of the next unexecuted step
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Supervisor structured output schema
 # ─────────────────────────────────────────────────────────────────────────────
+
+class PlanStep(BaseModel):
+    """A single step in the planner's execution plan."""
+    order: int = Field(description="1-based execution order.")
+    agent: Literal["kpi_configurator", "data_explorer", "amm", "supervisor"] = Field(
+        description="Which sub-agent will execute this step ('supervisor' for federated SQL)."
+    )
+    goal: str = Field(
+        description=(
+            "One sentence describing exactly what data to retrieve in this step. "
+            "May reference outputs of earlier steps by order number, e.g. "
+            "'Fetch energy_efficiency KPI values for the asset_ids returned in step 1'."
+        )
+    )
+
+
+class PlannerDecision(BaseModel):
+    reasoning: str = Field(description="Brief reasoning for the chosen plan.")
+    is_direct: bool = Field(
+        description="True if the question can be answered without any data lookup (greetings, general knowledge, etc.)."
+    )
+    direct_response: str | None = Field(
+        default=None,
+        description="Populated only when is_direct=True. The full user-facing answer.",
+    )
+    steps: list[PlanStep] = Field(
+        default_factory=list,
+        description="Ordered list of agent steps to execute. Empty when is_direct=True.",
+    )
+
 
 class RouterDecision(BaseModel):
     reasoning: str = Field(
@@ -183,6 +216,14 @@ def _build_supervisor_llm() -> Any:
     ).with_structured_output(RouterDecision)
 
 
+def _build_planner_llm() -> Any:
+    return ChatGoogleGenerativeAI(
+        model=settings.supervisor_model,
+        temperature=0,
+        max_retries=2,
+    ).with_structured_output(PlannerDecision)
+
+
 def _build_synthesis_llm() -> Any:
     """Plain (non-structured) LLM used by the summarise node."""
     return ChatGoogleGenerativeAI(
@@ -193,12 +234,158 @@ def _build_synthesis_llm() -> Any:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Planner node — runs ONCE at START to decompose the question
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PLANNER_SYSTEM_PROMPT = """You are a planning agent for an industrial IoT assistant.
+
+Your job is to analyse the user's question and create an ordered execution plan.
+
+Available agents:
+| Agent            | Handles |
+|---|---|
+| kpi_configurator | KPI definitions, formulas, calculated metric values, thresholds |
+| data_explorer    | Raw IoT sensor / tag readings, time-series telemetry |
+| amm              | Asset metadata, hierarchy, asset-to-sensor mapping |
+| supervisor       | Cross-domain SQL via federated database (use only for massive JOINs) |
+
+Planning rules:
+- If the user is greeting you or asking a general question with no data → set is_direct=True, direct_response=<friendly reply>.
+- If the question mentions a specific site, plant, or asset name → the FIRST step must always be an `amm` step to resolve the asset identifier.
+- Each step must be self-contained and reference earlier step outputs by order number if needed.
+- Keep the plan as short as possible. Avoid redundant steps.
+"""
+
+
+def make_planner_node(planner_llm):
+    """
+    Runs once at graph START. Decomposes the user question into an
+    ordered plan. Direct answers (greetings/chitchat) are returned
+    immediately without entering the supervisor loop.
+    """
+    def planner_node(state: SupervisorState) -> dict:
+        human_msgs = [m for m in state["messages"] if isinstance(m, HumanMessage)]
+        last_msg = human_msgs[-1] if human_msgs else state["messages"][-1]
+
+        messages = [
+            SystemMessage(content=_PLANNER_SYSTEM_PROMPT),
+            last_msg,
+        ]
+        plan: PlannerDecision = planner_llm.invoke(messages)
+
+        logger.info(
+            "Planner: is_direct=%s steps=%d reasoning=%s",
+            plan.is_direct,
+            len(plan.steps),
+            plan.reasoning,
+        )
+
+        trace_entry = AgentStepTrace(
+            type="route",
+            agent="planner",
+            content=plan.reasoning,
+        ).model_dump(mode="json")
+
+        if plan.is_direct:
+            reply = plan.direct_response or "Hello! How can I help you with your IoT data today?"
+            return {
+                "messages": [AIMessage(content=reply)],
+                "next_agent": "FINISH",
+                "supervisor_reasoning": plan.reasoning,
+                "reasoning_trace": [trace_entry],
+                "execution_plan": [],
+                "plan_step": 0,
+            }
+
+        steps_dicts = [s.model_dump() for s in plan.steps]
+        return {
+            "next_agent": "supervisor",
+            "supervisor_reasoning": plan.reasoning,
+            "reasoning_trace": [trace_entry],
+            "execution_plan": steps_dicts,
+            "plan_step": 0,
+        }
+
+    return planner_node
+
+
+def route_after_planner(state: SupervisorState) -> str:
+    """Direct FINISH for greetings; otherwise enter supervisor loop."""
+    if state.get("next_agent") == "FINISH":
+        return END
+    return "supervisor"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Graph nodes
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_supervisor_node(llm_with_structured_output):
     def supervisor_node(state: SupervisorState) -> dict:
-        """Analyse the conversation and decide routing."""
+        """Analyse the conversation, follow the execution plan, and decide routing."""
+
+        execution_plan: list[dict] = state.get("execution_plan", [])
+        plan_step: int = state.get("plan_step", 0)
+        routing_history: list[str] = state.get("routing_history", [])
+
+        # ── Plan-following mode ───────────────────────────────────────────────
+        # If the planner produced steps and we still have steps to execute,
+        # extract the next step and route directly without an extra LLM call.
+        if execution_plan and plan_step < len(execution_plan):
+            current_step = execution_plan[plan_step]
+            agent = current_step["agent"]
+            goal = current_step["goal"]
+
+            # Build agent_instruction that includes any data already collected.
+            ai_messages = [m for m in state["messages"] if isinstance(m, AIMessage)]
+            if ai_messages and plan_step > 0:
+                prior_data = "\n".join(
+                    f"[Step {i+1} result] {ai_messages[i].content[:400]}"
+                    for i in range(min(len(ai_messages), plan_step))
+                )
+                instruction = f"{goal}\n\nData collected so far:\n{prior_data}"
+            else:
+                instruction = goal
+
+            step_label = f"Step {plan_step+1}/{len(execution_plan)}: {goal[:60]}"
+            reasoning = f"I'm executing the plan — {step_label}."
+            logger.info("Planner step %d/%d → agent='%s' goal='%s'",
+                        plan_step + 1, len(execution_plan), agent, goal)
+
+            trace_entry = AgentStepTrace(
+                type="route", agent="supervisor", content=reasoning,
+            ).model_dump(mode="json")
+
+            new_messages: list[BaseMessage] = []
+            if agent != "supervisor":
+                new_messages = [HumanMessage(content=instruction)]
+
+            return {
+                "next_agent": agent,
+                "supervisor_reasoning": reasoning,
+                "reasoning_trace": [trace_entry],
+                "messages": new_messages,
+                "plan_step": plan_step + 1,
+                "routing_history": [],
+            }
+
+        # ── All plan steps done (or no plan) — decide FINISH/summarise ────────
+        # If we have collected data (plan had steps) → summarise.
+        if execution_plan and plan_step >= len(execution_plan):
+            reasoning = "I've collected all the required data. Synthesising the final answer."
+            trace_entry = AgentStepTrace(
+                type="route", agent="supervisor", content=reasoning,
+            ).model_dump(mode="json")
+            return {
+                "next_agent": "summarise",
+                "supervisor_reasoning": reasoning,
+                "reasoning_trace": [trace_entry],
+                "messages": [],
+                "routing_history": [],
+            }
+
+        # ── Fallback: no plan (unplanned federated / complex query) ───────────
+        # Keep the original LLM-based routing for edge cases.
 
         # Build a context block listing (agent, query) pairs already executed
         # so the supervisor knows what data it already has and what it can still request.
@@ -531,11 +718,12 @@ def build_supervisor_graph():
     All sub-agents must be registered in AgentRegistry before calling this.
     """
     supervisor_llm = _build_supervisor_llm()
+    planner_llm = _build_planner_llm()
     synthesis_llm = _build_synthesis_llm()
 
     graph = StateGraph(SupervisorState)
 
-    # Nodes
+    graph.add_node("planner", make_planner_node(planner_llm))
     graph.add_node("supervisor", make_supervisor_node(supervisor_llm))
     graph.add_node("kpi_configurator", make_sub_agent_node("kpi_configurator"))
     graph.add_node("data_explorer", make_sub_agent_node("data_explorer"))
@@ -543,7 +731,12 @@ def build_supervisor_graph():
     graph.add_node("summarise", make_summarise_node(synthesis_llm))
 
     # Edges
-    graph.add_edge(START, "supervisor")
+    graph.add_edge(START, "planner")
+    graph.add_conditional_edges(
+        "planner",
+        route_after_planner,
+        {"supervisor": "supervisor", END: END},
+    )
     graph.add_conditional_edges(
         "supervisor",
         route_after_supervisor,
@@ -610,6 +803,8 @@ async def stream_graph_events(
         "supervisor_reasoning": "",
         "reasoning_trace": [],
         "routing_history": [],
+        "execution_plan": [],
+        "plan_step": 0,
     }
 
     final_answer = ""
@@ -622,32 +817,39 @@ async def stream_graph_events(
             stream_mode="updates",
         ):
             for node_name, node_output in chunk.items():
-                if node_name == "supervisor":
+                if node_name in ("planner", "supervisor"):
                     reasoning = node_output.get("supervisor_reasoning", "")
                     next_agent = node_output.get("next_agent", "FINISH")
 
-                    if next_agent != "FINISH":
-                        event = SSERouteEvent(
-                            agent=next_agent,
-                            reasoning=reasoning,
-                        )
-                        yield f"data: {event.model_dump_json()}\n\n"
-                    else:
-                        # FINISH with direct_response — read from the AIMessage.
+                    if node_name == "planner" and next_agent == "FINISH":
+                        # Direct answer from planner (greeting / chitchat)
                         msgs = node_output.get("messages", [])
                         if msgs:
                             final_answer = getattr(msgs[-1], "content", "")
                             event = SSEAnswerEvent(
                                 content=final_answer,
                                 session_id=session_id,
-                                content_format=detect_content_format(
-                                    final_answer, preferred_format
-                                ),
+                                content_format=detect_content_format(final_answer, preferred_format),
                             )
                             yield f"data: {event.model_dump_json()}\n\n"
-                        # If msgs is empty → supervisor returned FINISH with no content
-                        # and route_after_supervisor will redirect to summarise.
-                        # The summarise node will emit the answer — nothing to do here.
+                        continue
+
+                    if next_agent not in ("FINISH", "", "summarise"):
+                        event = SSERouteEvent(agent=next_agent, reasoning=reasoning)
+                        yield f"data: {event.model_dump_json()}\n\n"
+                    elif next_agent == "FINISH":
+                        # Supervisor direct FINISH with direct_response
+                        msgs = node_output.get("messages", [])
+                        if msgs:
+                            final_answer = getattr(msgs[-1], "content", "")
+                            event = SSEAnswerEvent(
+                                content=final_answer,
+                                session_id=session_id,
+                                content_format=detect_content_format(final_answer, preferred_format),
+                            )
+                            yield f"data: {event.model_dump_json()}\n\n"
+                        # else: route_after_supervisor redirected to summarise — nothing to do here.
+
 
                 else:
                     # Sub-agent node output — emit tool call trace events
